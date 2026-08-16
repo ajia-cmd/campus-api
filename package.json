@@ -1,15 +1,15 @@
 {
-  "name": "campus-server",
+  "name": "campus-api",
   "version": "1.0.0",
-  "description": "",
+  "description": "校园网据 后端服务",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "express": "^4.19.2",
+    "sqlite3": "^5.1.7",
     "cors": "^2.8.5",
-    "express": "^4.21.0",
-    "node-cron": "^3.0.3",
-    "sqlite3": "^5.1.7"
+    "node-cron": "^3.0.3"
   }
 }
