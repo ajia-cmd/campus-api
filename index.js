@@ -10,17 +10,24 @@ app.use(cors());
 app.use(express.json());
 
 //打开sqlite数据库 users.db
+//⚠️ 如果磁盘已经存在users.db，会直接打开旧数据库，不会清空任何用户数据
 const db = new sqlite3.Database('./users.db', (err) => {
     if(err){
         console.error("数据库连接失败",err.message);
     }else{
         console.log("数据库连接成功");
-        //创建用户表
+        // IF NOT EXISTS：只有表不存在才新建；表已经存在就跳过，**不会删除旧数据**
         db.run(`CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL
-        )`);
+        )`, (err) => {
+            if(err){
+                console.error("建表异常", err);
+            }else{
+                console.log("数据表就绪，原有用户数据保留");
+            }
+        });
     }
 });
 
@@ -60,7 +67,7 @@ app.post('/api/user/find',(req,res)=>{
     })
 });
 
-//3.获取全部用户列表（包含密码，给admin后台调用）
+//3.获取全部用户列表（包含密码，admin后台调用）
 app.get('/api/user/list',(req,res)=>{
     const sql = `SELECT id,username,password FROM users`;
     db.all(sql,[],(err,rows)=>{
@@ -71,6 +78,31 @@ app.get('/api/user/list',(req,res)=>{
     })
 });
 
+//4.删除用户接口 管理员后台调用
+app.post('/api/user/delete', (req,res)=>{
+    const {username} = req.body;
+    if(!username){
+        return res.status(400).json({ok:false,msg:"缺少用户名"});
+    }
+    const sql = `DELETE FROM users WHERE username = ?`;
+    db.run(sql, [username], function(err){
+        if(err){
+            return res.status(500).json({ok:false,msg:"删除失败:"+err.message});
+        }
+        if(this.changes === 0){
+            return res.status(404).json({ok:false,msg:"该用户不存在"});
+        }
+        res.json({ok:true,msg:"删除成功"});
+    })
+});
+
+//进程关闭时安全关闭数据库
+process.on('SIGINT', () => {
+    db.close((err) => {
+        console.log("数据库已安全关闭");
+        process.exit(0);
+    })
+})
 
 app.listen(PORT,()=>{
     console.log(`服务启动，端口:${PORT}`);
