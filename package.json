@@ -1,9 +1,14 @@
 {
-  "name": "campus-backend",
+  "name": "campus-api",
   "version": "1.0.0",
+  "description": "校园网据后端",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "sqlite3": "^5.1.6",
