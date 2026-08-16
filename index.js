@@ -2,240 +2,85 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
 const cron = require('node-cron');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const port = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
 
-// ---------- 数据库初始化 ----------
-const db = new sqlite3.Database('./users.db', (err) => {
-    if(err){
-        console.error("数据库打开失败", err.message);
-    }else{
-        console.log("数据库连接成功");
-        initDB();
-    }
+// ===== QQ邮箱配置（填你自己的）=====
+const mailer = nodemailer.createTransport({
+  host: 'smtp.qq.com', port: 465, secure: true,
+  auth: { user: process.env.QQ_MAIL_USER, pass: process.env.QQ_MAIL_PASS }
 });
 
-// 建表（幂等）
-function initDB(){
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        is_banned INTEGER NOT NULL DEFAULT 0,
-        ban_expire_time DATETIME NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`, (err) => {
-        if(err){
-            console.error("建表失败", err.message);
-        }else{
-            console.log("用户表就绪");
-        }
-    });
-}
+// ===== 数据库 =====
+const db = new sqlite3.Database('./users.db', err=>{
+  if(err) console.error(err); else console.log('SQLite OK');
+});
+db.run(`CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE, password TEXT, email TEXT UNIQUE,
+  is_banned INTEGER DEFAULT 0, ban_expire_time DATETIME
+)`);
 
-// 兼容旧库：按需补字段
-db.all(`PRAGMA table_info(users)`, (err, rows) => {
-    if(err) return;
-    const cols = (rows || []).map(r => r.name);
-    if(!cols.includes('is_banned')){
-        db.run(`ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0`, ()=>{});
-    }
-    if(!cols.includes('ban_expire_time')){
-        db.run(`ALTER TABLE users ADD COLUMN ban_expire_time DATETIME NULL`, ()=>{});
-    }
-    if(!cols.includes('created_at')){
-        db.run(`ALTER TABLE users ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP`, ()=>{});
-    }
+// 定时解封
+cron.schedule('*/5 * * * *', ()=>{
+  db.run(`UPDATE users SET is_banned=0, ban_expire_time=NULL WHERE is_banned=1 AND ban_expire_time IS NOT NULL AND ban_expire_time < datetime('now')`);
 });
 
-// ---------- 工具函数 ----------
-function getBanExpireTime(banMinute){
-    if(!banMinute || banMinute <= 0) return null;
-    return new Date(Date.now() + banMinute * 60 * 1000).toISOString();
-}
+// ===== 保活接口（Render 用）=====
+app.get('/api/ping', (req,res)=>res.send('ok'));
 
-function checkBanStatus(row){
-    if(!row.is_banned){
-        return {banned:false};
-    }
-    if(!row.ban_expire_time){
-        return {
-            banned:true,
-            isForever:true,
-            msg:"账号已被永久封禁，无法登录"
-        };
-    }
-    const now = new Date();
-    const expire = new Date(row.ban_expire_time);
-    if(now >= expire){
-        return {banned:false, autoUnban:true};
-    }
-    const remainSecond = Math.ceil((expire.getTime() - now.getTime()) / 1000);
-    const h = Math.floor(remainSecond / 3600);
-    const m = Math.floor((remainSecond % 3600)/60);
-    const s = remainSecond % 60;
-    const formatStr = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-    return {
-        banned:true,
-        isForever:false,
-        remainSecond,
-        msg:`账号已被封禁，还有 ${formatStr} 自动解除封禁`
-    };
-}
-
-// 定时解封任务（每5分钟）
-function startBanCron(){
-    cron.schedule('*/5 * * * *', ()=>{
-        const nowIso = new Date().toISOString();
-        db.run(
-            `UPDATE users SET is_banned=0, ban_expire_time=NULL
-             WHERE is_banned=1 AND ban_expire_time IS NOT NULL AND ban_expire_time < ?`,
-            [nowIso],
-            function(err){
-                if(err){
-                    console.error("[封禁定时任务错误]", err);
-                }else if(this.changes > 0){
-                    console.log(`[定时任务]自动解封 ${this.changes} 个过期封禁账号`);
-                }
-            }
-        );
-    });
-    console.log("过期封禁定时任务已启动，每5分钟扫描一次");
-}
-startBanCron();
-
-// 注册参数校验（明文模式下依然要做基础校验）
-function validateRegister({username, password, email}){
-    if(!username || username.length < 3) return "账号至少3位";
-    if(!/^[a-zA-Z0-9_]+$/.test(username)) return "账号仅支持字母/数字/下划线";
-    if(!password || password.length < 6) return "密码至少6位";
-    if(!/^[\w.-]+@qq\.com$/i.test(email)) return "仅支持QQ邮箱";
-    return null;
-}
-
-// ---------- 注册接口（明文密码）----------
-app.post('/api/user/create', (req, res) => {
-    const {username, password, email} = req.body || {};
-    const errMsg = validateRegister({username, password, email});
-    if(errMsg) return res.status(400).json({msg:errMsg});
-
-    // 明文直接入库（按你的要求）
-    db.run(
-        `INSERT INTO users(username, password, email) VALUES (?,?,?)`,
-        [username, password, email],
-        function(err){
-            if(err){
-                console.error(err);
-                if(err.message.includes("UNIQUE constraint failed: users.username")){
-                    return res.status(400).json({msg:"该账号已经被注册"});
-                }
-                if(err.message.includes("UNIQUE constraint failed: users.email")){
-                    return res.status(400).json({msg:"该邮箱已经注册过账号，一个邮箱仅可注册一个账号"});
-                }
-                return res.status(500).json({msg:"注册数据库异常"});
-            }
-            res.json({ok:true, msg:"注册成功"});
-        }
-    );
+// ===== 发验证码 =====
+app.post('/api/mail/code', async (req,res)=>{
+  const {email}=req.body;
+  if(!/^[\w.-]+@qq\.com$/i.test(email)) return res.status(400).json({msg:'仅QQ邮箱'});
+  const code = String(Math.floor(100000+Math.random()*900000));
+  await mailer.sendMail({ from:process.env.QQ_MAIL_USER, to:email, subject:'验证码', text:`验证码：${code}，5分钟有效` });
+  res.json({ok:1, code}); // 前端临时存code，正式可删code只存后端
 });
 
-// ---------- 登录接口（明文比对 + 封禁检测）----------
-app.post('/api/user/find', (req, res) => {
-    const {username, password} = req.body || {};
-    if(!username || !password){
-        return res.status(400).json({msg:"账号和密码不能为空"});
-    }
-
-    db.get(`SELECT * FROM users WHERE username=?`, [username], (err, row) => {
-        if(err) return res.status(500).json({msg:"数据库错误"});
-        if(!row) return res.status(400).json({msg:"账号或者密码错误"});
-
-        // 明文比对
-        if(row.password !== password){
-            return res.status(400).json({msg:"账号或者密码错误"});
-        }
-
-        const banInfo = checkBanStatus(row);
-        if(banInfo.autoUnban){
-            db.run(`UPDATE users SET is_banned=0, ban_expire_time=NULL WHERE id=?`, [row.id]);
-        }
-        if(banInfo.banned){
-            return res.status(403).json({
-                code:403,
-                msg:banInfo.msg,
-                data:{
-                    isForever: banInfo.isForever,
-                    remainSecond: banInfo.remainSecond ?? null
-                }
-            });
-        }
-
-        res.json({ok:true, username:row.username});
-    });
+// ===== 注册 =====
+app.post('/api/user/create', (req,res)=>{
+  const {username,password,email,code,realCode}=req.body;
+  if(code!==realCode) return res.status(400).json({msg:'验证码错'});
+  db.run(`INSERT INTO users(username,password,email) VALUES(?,?,?)`,[username,password,email],
+    e=> e?res.status(400).json({msg:'账号/邮箱已存在'}):res.json({msg:'注册成功'}));
 });
 
-// ---------- 获取用户列表（管理后台用）----------
-// 注意：返回密码是明文（按你当前设定），后台可直接展示
-app.get('/api/user/list', (req, res) => {
-    db.all(
-        `SELECT id, username, password, email, is_banned, ban_expire_time, created_at FROM users`,
-        [],
-        (err, rows) => {
-            if(err) return res.status(500).json({msg:"读取失败"});
-            res.json({list: rows || []});
-        }
-    );
+// ===== 登录（明文+封禁）=====
+app.post('/api/user/find', (req,res)=>{
+  const {username,password}=req.body;
+  db.get(`SELECT * FROM users WHERE username=?`,[username],(e,r)=>{
+    if(!r||r.password!==password) return res.status(400).json({msg:'账号或密码错'});
+    if(r.is_banned&&(!r.ban_expire_time||new Date(r.ban_expire_time)>new Date()))
+      return res.status(403).json({msg:'账号被封禁'});
+    res.json({ok:1, username});
+  });
 });
 
-// ---------- 删除用户 ----------
-app.post('/api/user/delete', (req, res) => {
-    const {username} = req.body || {};
-    if(!username) return res.status(400).json({msg:"用户名不能为空"});
-    db.run(`DELETE FROM users WHERE username=?`, [username], function(err){
-        if(err) return res.status(500).json({msg:"删除失败"});
-        if(this.changes === 0) return res.status(400).json({msg:"该用户不存在"});
-        res.json({ok:true, msg:"删除成功"});
-    });
+// ===== 用户列表 =====
+app.get('/api/user/list', (req,res)=>{
+  db.all(`SELECT username,password,email,is_banned,ban_expire_time FROM users`,[],(e,r)=>res.json({list:r}));
 });
 
-// ---------- 封禁用户 ----------
-app.post('/api/admin/ban-user', (req, res) => {
-    const {email, banMinute} = req.body || {};
-    if(!email) return res.status(400).json({msg:"邮箱不能为空"});
-    const expireStr = getBanExpireTime(Number(banMinute) || 0);
-    const isForever = !expireStr;
-    db.run(
-        `UPDATE users SET is_banned=1, ban_expire_time=? WHERE email=?`,
-        [isForever ? null : expireStr, email],
-        function(err){
-            if(err) return res.status(500).json({msg:"封禁失败"});
-            if(this.changes === 0) return res.status(404).json({msg:"该邮箱账号不存在"});
-            res.json({ok:true, msg: isForever ? "已永久封禁" : "封禁成功"});
-        }
-    );
+// ===== 删除 =====
+app.post('/api/user/delete', (req,res)=>{
+  db.run(`DELETE FROM users WHERE username=?`,[req.body.username],()=>res.json({ok:1}));
 });
 
-// ---------- 解封用户 ----------
-app.post('/api/admin/unban-user', (req, res) => {
-    const {email} = req.body || {};
-    if(!email) return res.status(400).json({msg:"邮箱不能为空"});
-    db.run(
-        `UPDATE users SET is_banned=0, ban_expire_time=NULL WHERE email=?`,
-        [email],
-        function(err){
-            if(err) return res.status(500).json({msg:"解封失败"});
-            if(this.changes === 0) return res.status(404).json({msg:"账号不存在"});
-            res.json({ok:true, msg:"已解除封禁"});
-        }
-    );
+// ===== 封禁 =====
+app.post('/api/admin/ban-user', (req,res)=>{
+  const {email,banMinute}=req.body;
+  const t = banMinute>0?`datetime('now','+${banMinute} minutes')`:null;
+  db.run(`UPDATE users SET is_banned=1, ban_expire_time=${t?'?':null}`, t?[t,email]:[email],()=>res.json({ok:1}));
 });
 
-// ---------- 启动 ----------
-app.listen(port, () => {
-    console.log(`服务启动，端口：${port}`);
+// ===== 解封 =====
+app.post('/api/admin/unban-user', (req,res)=>{
+  db.run(`UPDATE users SET is_banned=0, ban_expire_time=NULL WHERE email=?`,[req.body.email],()=>res.json({ok:1}));
 });
+
+app.listen(port,()=>console.log('Server on',port));
